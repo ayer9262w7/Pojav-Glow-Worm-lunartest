@@ -1,0 +1,96 @@
+name: Auto-merge lunar_test from NotAHero04/PojavLauncher
+
+on:
+  schedule:
+    - cron: '0 3 * * *'    # chạy hàng ngày UTC 03:00 (tùy chỉnh)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge-and-build:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: https://github.com/NotAHero04/PojavLauncher.git
+      UPSTREAM_BRANCH: lunar_test
+      PR_BRANCH: auto/merge-lunar_test-${{ github.run_id }}
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and fetch
+        run: |
+          git remote add upstream "${{ env.UPSTREAM_REPO }}" || true
+          git fetch upstream --no-tags --prune
+
+      - name: Create PR branch
+        run: |
+          git checkout -b "${PR_BRANCH}"
+
+      - name: Attempt merge upstream lunar_test
+        id: try-merge
+        run: |
+          set -e
+          echo "Merging upstream/${UPSTREAM_BRANCH} into ${PR_BRANCH}"
+          if git merge --no-edit "upstream/${UPSTREAM_BRANCH}"; then
+            echo "MERGE_RESULT=clean" >> $GITHUB_OUTPUT
+          else
+            echo "Primary merge failed; trying auto-resolve with 'theirs' strategy fallback"
+            git merge -s recursive -X theirs --no-edit "upstream/${UPSTREAM_BRANCH}" || true
+            if [ "$(git ls-files -u | wc -l)" -eq 0 ]; then
+              echo "MERGE_RESULT=auto-resolved" >> $GITHUB_OUTPUT
+            else
+              echo "MERGE_RESULT=conflicts" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Build (Gradle) and capture log
+        continue-on-error: true
+        run: |
+          chmod +x gradlew || true
+          mkdir -p build-artifacts
+          ./gradlew build --no-daemon > build-artifacts/build.log 2>&1 || true
+          ./gradlew assembleDebug --no-daemon >> build-artifacts/build.log 2>&1 || true
+          tar -czf build-artifacts.tar.gz build-artifacts || true
+
+      - name: Try auto-fixes (formatters) and commit
+        run: |
+          set -e || true
+          if ./gradlew -v >/dev/null 2>&1 && ./gradlew tasks --all | grep -q spotlessApply; then
+            ./gradlew spotlessApply --no-daemon || true
+          fi
+          git add -A
+          git diff --cached --quiet || git commit -m "chore: apply automatic formatting/cleanup" || true
+
+      - name: Create Pull Request (if there are changes or merge happened)
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore(auto-merge): merge upstream lunar_test from NotAHero04/PojavLauncher"
+          branch: ${{ env.PR_BRANCH }}
+          title: "Auto-merge: upstream/lunar_test -> ${GITHUB_REF_NAME}"
+          body: |
+            This PR was created automatically by workflow auto-merge-lunar_test.
+            - Upstream: ${{ env.UPSTREAM_REPO }}
+            - Upstream branch: ${{ env.UPSTREAM_BRANCH }}
+            - Merge result: ${{ steps.try-merge.outputs.MERGE_RESULT }}
+            
+            Build log is attached to the workflow run artifacts.
+          labels: auto-merge, from-lunar_test
+          draft: false
+
+      - name: Upload build log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: build-artifacts.tar.gz 
